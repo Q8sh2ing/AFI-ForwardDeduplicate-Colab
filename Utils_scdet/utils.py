@@ -23,7 +23,7 @@ import psutil
 from sklearn import linear_model
 
 from Utils_scdet.StaticParameters import RGB_TYPE, IS_RELEASE, IS_CLI, appDir, SupportFormat
-from skvideo.utils import startupinfo
+# from skvideo.utils import startupinfo
 
 
 class DefaultConfigParser(ConfigParser):

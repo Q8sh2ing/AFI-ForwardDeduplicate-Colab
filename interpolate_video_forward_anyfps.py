@@ -13,7 +13,24 @@ from models.IFNet_HDv3 import IFNet
 from Utils_scdet.scdet import SvfiTransitionDetection
 
 warnings.filterwarnings("ignore")
-torch.set_grad_enabled(False)
+
+
+class TMapper:
+    def __init__(self, src=-1, dst=0, times=None):
+        self.times = dst / src if times is None else times
+        self.now_step = -1
+
+    def get_range_timestamps(self, _min: float, _max: float, lclose=True, rclose=False, normalize=True) -> list:
+        _min_step = math.ceil(_min * self.times)
+        _max_step = math.ceil(_max * self.times)
+        _start = _min_step if lclose else _min_step + 1
+        _end = _max_step if not rclose else _max_step + 1
+        if _start >= _end:
+            return []
+        if normalize:
+            return [((_i / self.times) - _min) / (_max - _min) for _i in range(_start, _end)]
+        return [_i / self.times for _i in range(_start, _end)]
+
 
 parser = argparse.ArgumentParser(description='Interpolation a video with AFI-ForwardDeduplicate')
 parser.add_argument('-i', '--video', dest='video', type=str, default='1.mp4', help='input the path of input video')
@@ -21,7 +38,7 @@ parser.add_argument('-o', '--output_dir', dest='output_dir', type=str, default='
                     help='the folder path where save output frames')
 parser.add_argument('-nf', '--n_forward', dest='n_forward', type=int, default=2,
                     help='the value of parameter n_forward')
-parser.add_argument('-t', '--times', dest='times', type=int, default=2, help='the interpolation ratio')
+parser.add_argument('-fps', '--target_fps', dest='target_fps', type=int, default=60, help='interpolate to ? fps')
 parser.add_argument('-m', '--model_type', dest='model_type', type=str, default='gmfss',
                     help='the interpolation model to use (gmfss/rife)')
 parser.add_argument('-s', '--enable_scdet', dest='enable_scdet', action='store_true', default=False,
@@ -42,7 +59,7 @@ args = parser.parse_args()
 
 model_type = args.model_type
 n_forward = args.n_forward  # max_consistent_deduplication_counts - 1
-times = args.times  # interpolation ratio >= 2
+target_fps = args.target_fps  # interpolation ratio >= 2
 enable_scdet = args.enable_scdet  # enable scene change detection
 scdet_threshold = args.scdet_threshold  # scene change detection threshold
 shrink_transition_frames = args.shrink  # shrink the frames of transition
@@ -54,8 +71,6 @@ disable_cupy = args.disable_cupy
 half = args.half
 
 assert model_type in ['gmfss', 'rife'], f"not implement the model {model_type}"
-# assert n_forward > 0, "the parameter n_forward must larger then zero"
-assert times >= 2, "at least interpolate two times"
 
 if not os.path.exists(video):
     raise FileNotFoundError(f"can't find the file {video}")
@@ -159,6 +174,7 @@ write_buffer = Queue(maxsize=-1)
 _thread.start_new_thread(build_read_buffer, (read_buffer, video_capture))
 _thread.start_new_thread(clear_write_buffer, (write_buffer,))
 pbar = tqdm(total=total_frames_count)
+mapper = TMapper(times=args.target_fps / ori_fps)
 
 if n_forward == 0:
     n_forward = math.ceil(ori_fps / 24000 * 1001) * 2
@@ -254,24 +270,15 @@ queue_input = [get()]
 queue_output = []
 saved_result = {}
 output0 = None
-# if times = 5, n_forward=3, right=6, left=7
-right_infill = (times * n_forward) // 2 - 1
-left_infill = right_infill + (times * n_forward) % 2
 
-if shrink_transition_frames:
-    right_infill += times - 1
-
-times_ts = [i / times for i in range(1, times)]
-
+idx = 0
 while True:
     if output0 is None:
         queue_input.extend(get() for _ in range(n_forward))
-
         output0, count = decrease_inference(queue_input.copy())
 
-        queue_output.append(queue_input[0])
         inputs = [queue_input[0]]
-      
+
         depth = int(max(saved_result.keys())[0])
         inputs.extend(saved_result[f'{layer}0'] for layer in range(1, depth + 1))
 
@@ -279,96 +286,103 @@ while True:
             inputs = [inputs[0]] + correct_inputs(inputs, len(inputs) - 2) + [inputs[-1]]
 
         timestamp = [0.5 * layer for layer in range(0, n_forward + 1)]
-        t_step = timestamp[-1] / (left_infill + 1)
-        require_timestamp = [t_step * i for i in range(1, left_infill + 1)]
+        timestamps = mapper.get_range_timestamps(idx, idx + 0.5 * n_forward, normalize=False)
+        require_timestamp = [_t - idx for _t in timestamps]
 
         for i in range(len(timestamp) - 1):
             t0, t1 = timestamp[i], timestamp[i + 1]
-          
+
             if t0 in require_timestamp:
-                queue_output.append(inputs[i])
+                put(inputs[i])
                 require_timestamp.remove(t0)
 
             condition_middle = [rt for rt in require_timestamp if t0 < rt < t1]
             if len(condition_middle) != 0:
                 inp0, inp1 = map(to_tensor, [inputs[i], inputs[i + 1]])
                 outputs = gen_ts_frame(inp0, inp1, scale, [(t - t0) * 2 for t in condition_middle])
-                queue_output.extend(outputs)
-              
+                for out in outputs:
+                    put(out)
+
             if t1 in require_timestamp:
-                queue_output.append(inputs[i + 1])
+                put(inputs[i + 1])
                 require_timestamp.remove(t1)
-              
+
             if len(require_timestamp) == 0:
                 break
+
+        idx += 0.5 * n_forward
 
     _ = queue_input.pop(0)
     queue_input.append(get())
 
     if (queue_input[-1] is None) or scene_detection.check_scene(queue_input[-2], queue_input[-1]):
 
-        queue_output.append(output0)
-      
+        # test
+        # if queue_input[-1] is not None:
+        #     print("find scene...")
+        # test
+
         depth = int(max(saved_result.keys())[0])
         inputs = list(saved_result[f'{layer}{depth - layer}'] for layer in range(depth, 0, -1))
         inputs.append(queue_input[-2])
 
-        timestamp = [0.5 * layer for layer in range(0, n_forward + 1)]
-        t_step = timestamp[-1] / (right_infill + 1)
-        require_timestamp = [t_step * i for i in range(1, right_infill + 1)]
-      
         if enable_correct_inputs and len(inputs) > 2:
             inputs = [inputs[0]] + correct_inputs(inputs, len(inputs) - 2) + [inputs[-1]]
-          
+
+        timestamp = [0.5 * layer for layer in range(0, n_forward + 1)]
+        require_timestamp = mapper.get_range_timestamps(
+            idx,
+            idx + 1 + 0.5 * n_forward,
+            normalize=False
+        )
+        t_step = timestamp[-1] / len(require_timestamp)
+        require_timestamp = [t_step * i for i in range(1, len(require_timestamp))]
+
         for i in range(len(timestamp) - 1):
             t0, t1 = timestamp[i], timestamp[i + 1]
-          
             if t0 in require_timestamp:
-                queue_output.append(inputs[i])
+                put(inputs[i])
                 require_timestamp.remove(t0)
 
             condition_middle = [rt for rt in require_timestamp if t0 < rt < t1]
             if len(condition_middle) != 0:
                 inp0, inp1 = map(to_tensor, [inputs[i], inputs[i + 1]])
                 outputs = gen_ts_frame(inp0, inp1, scale, [(t - t0) * 2 for t in condition_middle])
-                queue_output.extend(outputs)
+                for out in outputs:
+                    put(out)
 
             if t1 in require_timestamp:
-                queue_output.append(inputs[i + 1])
+                put(inputs[i + 1])
                 require_timestamp.remove(t1)
-              
+
             if len(require_timestamp) == 0:
                 break
 
-        queue_output.append(queue_input[-2])
-
-        if not shrink_transition_frames:
-            queue_output.extend([queue_input[-2]] * (times - 1))
-
-        for out in queue_output:
-            put(out)
+        if len(require_timestamp) - 1 > 0:
+            put(queue_input[-2])
 
         if queue_input[-1] is None:
             break
 
         queue_input = [queue_input[-1]]
-        queue_output = list()
         saved_result = dict()
         output0 = None
+        idx += 2
         pbar.update(1)
         continue
 
     output1, count = decrease_inference(queue_input.copy())
 
-    queue_output.append(output0)
+    ts = mapper.get_range_timestamps(idx, idx + 1, normalize=True)
+    if 0 in ts:
+        put(output0)
+        ts.pop(0)
     inp0, inp1 = map(to_tensor, [output0, output1])
-    queue_output.extend(gen_ts_frame(inp0, inp1, scale, times_ts))
-
-    for out in queue_output:
+    for out in gen_ts_frame(inp0, inp1, scale, ts):
         put(out)
 
-    queue_output.clear()
     output0 = output1
+    idx += 1
     pbar.update(1)
 
 print('Wait for all frames to be exported...')
