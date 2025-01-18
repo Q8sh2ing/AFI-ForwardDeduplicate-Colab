@@ -1,3 +1,5 @@
+# MOVED TO [MultiPassDedup](https://github.com/routineLife1/MultiPassDedup)
+
 # 📖AFI-ForwardDeduplicate
 
 ### Efficient Deduplicate for Anime Video Frame Interpolation
